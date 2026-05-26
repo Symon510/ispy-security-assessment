@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Build artifacts (in case anyone clones iSpy alongside)
+bin/
+obj/
+*.exe
+*.dll
+*.pdb

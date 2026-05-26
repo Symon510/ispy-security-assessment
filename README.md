@@ -145,7 +145,7 @@ The findings were discovered as a class assignment in 2026. The vulnerabilities 
 
 ## About me
 
-Graduate student in Computer Science at the University of North Texas, focusing on secure software systems. Currently looking for **summer 2026 internships in SOC, application security, or penetration testing.**
+Graduate student in Computer Science at the University of North Texas, focusing on secure software systems.
 
 - LinkedIn: [Simon Richards](https://www.linkedin.com/in/simon-richards-0a65b216a/)
 - Email: symon.510@gmail.com

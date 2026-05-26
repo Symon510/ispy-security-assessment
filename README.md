@@ -6,7 +6,7 @@ A source-level security assessment of [iSpy](https://github.com/ispysoftware/iSp
 **Institution:** University of North Texas
 **Semester:** Spring 2026
 **Team:** Group project — Simon Richards, Sreeja Badri, Aryan Kumar, Dinesh Melimi
-**Published with the team's permission as a portfolio artifact.**
+
 
 ---
 

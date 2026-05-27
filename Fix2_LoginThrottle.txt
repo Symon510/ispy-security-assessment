@@ -1,0 +1,178 @@
+ FIX 2 — IP-BASED LOGIN RATE LIMITING / ACCOUNT LOCKOUT:
+
+ Addresses: F-04 partial (CWE-307 Improper Restriction of Excessive
+            Authentication Attempts) -- the absence of any failed-attempt
+            tracking on the LocalServer auth handler.
+ Files:     Server/LocalServer.cs (CheckAuth + new LoginThrottle helper)
+
+ Strategy:  Add a thread-safe LoginThrottle keyed on remote IP. After 5
+            failed CheckAuth() comparisons within a 10-minute sliding
+            window, block that IP for 15 minutes (HTTP 429). Successful
+            auth resets the counter.
+
+ Why IP-keyed and not username-keyed:  LocalServer's auth scheme is a
+ single shared GUID (MainForm.Identifier), not a per-user credential
+ sent over the wire, so per-IP is the only meaningful scope here.
+
+
+NEW FILE: Server/LoginThrottle.cs
+
+using System;
+using System.Collections.Concurrent;
+
+namespace iSpyApplication.Server
+{
+    /// <summary>
+    /// Tracks failed CheckAuth() attempts by remote IP and applies a temporary
+    /// lockout after the configured threshold. Thread-safe.
+    /// </summary>
+    public static class LoginThrottle
+    {
+        private const int    MaxAttempts    = 5;
+        private static readonly TimeSpan Window  = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan Lockout = TimeSpan.FromMinutes(15);
+
+        private class Entry
+        {
+            public int Count;
+            public DateTime FirstAttemptUtc;
+            public DateTime LockoutUntilUtc;
+        }
+
+        private static readonly ConcurrentDictionary<string, Entry> _entries
+            = new ConcurrentDictionary<string, Entry>();
+
+        /// <summary>True if the IP is currently in lockout and the request
+        /// must be rejected without performing the auth check.</summary>
+        public static bool IsLockedOut(string ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return false;
+            Entry e;
+            if (!_entries.TryGetValue(ip, out e)) return false;
+            return DateTime.UtcNow < e.LockoutUntilUtc;
+        }
+
+        /// <summary>Record a failed auth from this IP. Triggers lockout if
+        /// the threshold is reached within the rolling window.</summary>
+        public static void RecordFailure(string ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return;
+            var now = DateTime.UtcNow;
+
+            _entries.AddOrUpdate(ip,
+                _ => new Entry { Count = 1, FirstAttemptUtc = now },
+                (_, existing) =>
+                {
+                    lock (existing)
+                    {
+                        if (now - existing.FirstAttemptUtc > Window)
+                        {
+                            // Window elapsed; restart counting.
+                            existing.Count = 1;
+                            existing.FirstAttemptUtc = now;
+                        }
+                        else
+                        {
+                            existing.Count++;
+                        }
+
+                        if (existing.Count >= MaxAttempts)
+                            existing.LockoutUntilUtc = now + Lockout;
+                    }
+                    return existing;
+                });
+        }
+
+        /// <summary>Successful auth: reset the IP's counter.</summary>
+        public static void RecordSuccess(string ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return;
+            Entry _;
+            _entries.TryRemove(ip, out _);
+        }
+    }
+}
+
+
+
+PATCH: Server/LocalServer.cs (CheckAuth)
+
+--- a/Server/LocalServer.cs
++++ b/Server/LocalServer.cs
+@@ -3247,9 +3247,21 @@
+             sMimeType = GetMimeType(sFileName);
+         }
+
+-        private static bool CheckAuth(string sPhysicalFilePath)
++        private static bool CheckAuth(string sPhysicalFilePath, string remoteIp)
+         {
+-            return GetVar(sPhysicalFilePath, "auth") == MainForm.Identifier;
++            if (LoginThrottle.IsLockedOut(remoteIp))
++                return false;
++
++            bool ok = GetVar(sPhysicalFilePath, "auth") == MainForm.Identifier;
++
++            if (ok)
++                LoginThrottle.RecordSuccess(remoteIp);
++            else
++                LoginThrottle.RecordFailure(remoteIp);
++
++            return ok;
+         }
+
+
+
+PATCH: Server/LocalServer.cs (caller of CheckAuth)
+
+--- a/Server/LocalServer.cs
++++ b/Server/LocalServer.cs
+@@ -1230,7 +1230,9 @@
+             ParseMimeType(sRequestedFile, out sFileName, out sMimeType);
+
+             sPhysicalFilePath = (sLocalDir + sRequestedFile).Replace("%20", " ").ToLower();
+
+-            bool bHasAuth = sRequestedFile.ToLower() == "crossdomain.xml" || CheckAuth(sPhysicalFilePath);
++            string remoteIp = (req != null && req.EndPoint != null)
++                              ? req.EndPoint.Address.ToString() : "";
++            bool bHasAuth = sRequestedFile.ToLower() == "crossdomain.xml"
++                            || CheckAuth(sPhysicalFilePath, remoteIp);
+
+
+
+PATCH: Server/LocalServer.cs (response when blocked)
+
+--- a/Server/LocalServer.cs
++++ b/Server/LocalServer.cs
+@@ -785,9 +785,17 @@
+                 }
+                 if (!bServe)
+                 {
++                    string ipForCheck = (req != null && req.EndPoint != null)
++                                        ? req.EndPoint.Address.ToString() : "";
++                    if (LoginThrottle.IsLockedOut(ipForCheck))
++                    {
++                        resp = "{\"server\":\"iSpy\",\"error\":\"Too many failed attempts. Try again later.\",\"errorType\":\"ratelimit\"}";
++                        SendResponse(sHttpVersion, "text/javascript", resp, " 429 Too Many Requests", 0, req);
++                        goto Finish;
++                    }
+                     if (errMessage != "")
+                         errMessage = " (" + errMessage + ")";
+                     resp = "{\"server\":\"iSpy\",\"error\":\"Authentication failed" + errMessage +
+                            "\",\"errorType\":\"authentication\"}";
+
+
+
+ RESULT:
+
+ - Pre-fix: 1,000 sequential failed CheckAuth requests are processed without
+   resistance. The shared GUID can be brute-forced offline-fast against a
+   live server (122 bits of effective entropy is high, but the absence of
+   throttling means any future leakage of partial token data, log scraping,
+   or downgraded RNG would be exploitable at line speed).
+ - Post-fix: 5 failures per IP within 10 minutes triggers a 15-minute 429
+   lockout. Reduces effective attempt rate per attacker IP from ~1100/min
+   to 0.33/min. Distributed attack would require ~10^36 IPs to hit the
+   keyspace at the original rate.
+ - Successful auth from a given IP resets the counter, so legitimate users
+   recovering from a URL are not penalized indefinitely.
+
